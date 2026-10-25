@@ -1,0 +1,128 @@
+---
+- name: OS | Generate or load the DR passphrase (saved on the controller first)
+  ansible.builtin.set_fact:
+    luks_passphrase: "{{ lookup('ansible.builtin.password', luks_os_local_key ~ ' length=' ~ luks_key_length ~ ' chars=ascii_letters,digits') }}"
+  no_log: true
+
+- name: OS | Enrol the DR passphrase in a free key slot
+  when: not (luks_os_key_enrolled | bool)
+  block:
+    - name: OS | Need the install passphrase once
+      ansible.builtin.assert:
+        that: luks_os_existing_passphrase | length > 0
+        fail_msg: Set luks_os_existing_passphrase (vaulted) so the DR passphrase can be added.
+
+    - name: OS | Stage both passphrases in RAM (/run)
+      ansible.builtin.copy:
+        dest: "{{ item.path }}"
+        content: "{{ item.value }}"
+        owner: root
+        group: root
+        mode: "0400"
+      loop:
+        - { path: /run/luks-os-old.key, value: "{{ luks_os_existing_passphrase }}" }
+        - { path: /run/luks-os-new.key, value: "{{ luks_passphrase }}" }
+      no_log: true
+
+    - name: OS | Add the DR passphrase
+      ansible.builtin.command: >-
+        cryptsetup luksAddKey --key-file /run/luks-os-old.key
+        {{ luks_os_dev }} /run/luks-os-new.key
+      register: luks_os_added
+      changed_when: true
+  always:
+    - name: OS | Remove staged passphrases
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /run/luks-os-old.key
+        - /run/luks-os-new.key
+
+- name: OS | Bind to tang
+  ansible.builtin.command:
+    argv: [clevis, luks, bind, -y, -d, "{{ luks_os_dev }}", -k, "-", sss, "{{ luks_clevis_sss | to_json }}"]
+    stdin: "{{ luks_passphrase }}"
+    stdin_add_newline: false
+  register: luks_os_bind
+  changed_when: true
+  no_log: true
+  when: not (luks_os_bound | bool)
+  notify: Regenerate initramfs
+
+- name: OS | Find the clevis key slot
+  ansible.builtin.shell: |
+    set -o pipefail
+    clevis luks list -d {{ luks_os_dev }} | awk -F: '/sss|tang/ {print $1; exit}'
+  args:
+    executable: /bin/bash
+  register: luks_os_slot
+  changed_when: false
+
+- name: OS | Prove tang can unlock the volume
+  ansible.builtin.shell: |
+    set -o pipefail
+    clevis luks pass -d {{ luks_os_dev }} -s {{ luks_os_slot.stdout | trim }} \
+      | cryptsetup open --test-passphrase --key-file=- {{ luks_os_dev }}
+  args:
+    executable: /bin/bash
+  changed_when: false
+  no_log: true
+
+- name: OS | Check for a header backup
+  ansible.builtin.stat:
+    path: "{{ luks_os_header_file }}"
+  register: luks_os_header_stat
+
+- name: OS | Back up the LUKS header
+  ansible.builtin.shell: >-
+    rm -f {{ luks_os_header_file }} &&
+    cryptsetup luksHeaderBackup {{ luks_os_dev }} --header-backup-file {{ luks_os_header_file }} &&
+    chmod 0400 {{ luks_os_header_file }}
+  when: (not luks_os_header_stat.stat.exists) or (luks_os_added is changed) or (luks_os_bind is changed)
+  changed_when: true
+
+- name: OS | Copy the header backup to the controller
+  ansible.builtin.fetch:
+    src: "{{ luks_os_header_file }}"
+    dest: "{{ luks_keys_local_dir }}/{{ inventory_hostname }}/"
+    flat: true
+
+- name: OS | Read kernel arguments
+  ansible.builtin.command: grubby --info=ALL
+  register: luks_grubby
+  changed_when: false
+
+- name: OS | Bring up networking in the initramfs
+  ansible.builtin.command: grubby --update-kernel=ALL --args="{{ item }}"
+  loop: "{{ (['rd.neednet=1'] if luks_os_rd_neednet | bool else []) + ([luks_os_kernel_ip_arg] if luks_os_kernel_ip_arg | length > 0 else []) }}"
+  when: luks_grubby.stdout_lines | select('match', '^args=') | reject('search', item | regex_escape) | list | length > 0
+  changed_when: true
+
+- name: OS | Read the root crypttab entry
+  ansible.builtin.shell: |
+    set -o pipefail
+    uuid=$(cryptsetup luksUUID {{ luks_os_dev }})
+    grep -E "^[^#]\S*\s+UUID=$uuid\s" /etc/crypttab | awk '{print $3}'
+  args:
+    executable: /bin/bash
+  register: luks_os_crypttab_key
+  changed_when: false
+  failed_when: false
+
+- name: OS | Warn if root is set to unlock from a local key file
+  ansible.builtin.debug:
+    msg: >-
+      WARNING: /etc/crypttab unlocks the root volume with '{{ luks_os_crypttab_key.stdout | trim }}'.
+      For network-only unlock this should be 'none'. Not changed automatically.
+  when:
+    - luks_os_crypttab_key.stdout | trim | length > 0
+    - luks_os_crypttab_key.stdout | trim not in ['none', '-']
+
+- name: OS | Write recovery notes on the controller
+  ansible.builtin.copy:
+    dest: "{{ luks_keys_local_dir }}/{{ inventory_hostname }}/{{ luks_os_name }}.yml"
+    mode: "0600"
+    content: "{{ {'type': 'os', 'device': luks_os_dev, 'key_file': luks_os_name ~ '.key', 'header_backup': luks_os_header_file | basename, 'tang_servers': luks_tang_servers | map(attribute='url') | list} | to_nice_yaml }}"
+  delegate_to: localhost
+  become: false

@@ -1,0 +1,114 @@
+---
+# Only reached for devices lsblk + facts called blank, and with
+# luks_allow_format true.
+- name: "{{ luks_data_dev }} | Names"
+  ansible.builtin.include_tasks: data_names.yml
+
+- name: "{{ luks_data_dev }} | Refuse if a key with this name already exists on the controller"
+  ansible.builtin.stat:
+    path: "{{ luks_local_key }}"
+  register: luks_existing_local_key
+  delegate_to: localhost
+  become: false
+
+- name: "{{ luks_data_dev }} | Stop: existing controller key for a 'blank' disk"
+  ansible.builtin.fail:
+    msg: >-
+      {{ luks_local_key }} already exists but {{ luks_data_dev }} looks blank.
+      This disk may have been wiped or swapped. Move the old key aside first.
+  when: luks_existing_local_key.stat.exists
+
+- name: "{{ luks_data_dev }} | Generate passphrase (saved on the controller first)"
+  ansible.builtin.set_fact:
+    luks_passphrase: "{{ lookup('ansible.builtin.password', luks_local_key ~ ' length=' ~ luks_key_length ~ ' chars=ascii_letters,digits') }}"
+  no_log: true
+
+- name: "{{ luks_data_dev }} | Confirm the key was written to the controller"
+  ansible.builtin.stat:
+    path: "{{ luks_local_key }}"
+  register: luks_saved_key
+  delegate_to: localhost
+  become: false
+  failed_when: not luks_saved_key.stat.exists or luks_saved_key.stat.size == 0
+
+# lsblk reads udev's cache; wipefs reads the disk itself. It lists
+# every signature it finds (LUKS, filesystem, RAID member, LVM,
+# partition table). Anything at all stops the format.
+- name: "{{ luks_data_dev }} | Final check straight from the disk"
+  ansible.builtin.command: wipefs --no-act --noheadings {{ luks_data_dev }}
+  register: luks_final_check
+  changed_when: false
+  failed_when: luks_final_check.rc != 0 or luks_final_check.stdout | trim | length > 0
+
+- name: "{{ luks_data_dev }} | luksFormat (LUKS2, key from stdin, never written to disk)"
+  ansible.builtin.command:
+    argv: "{{ ['cryptsetup', 'luksFormat', '--type', 'luks2', '--batch-mode', '--label', luks_label, '--key-file=-'] + luks_format_extra_args + [luks_data_dev] }}"
+    stdin: "{{ luks_passphrase }}"
+    stdin_add_newline: false
+  changed_when: true
+  no_log: true
+
+- name: "{{ luks_data_dev }} | Bind to tang"
+  ansible.builtin.command:
+    argv: [clevis, luks, bind, -y, -d, "{{ luks_data_dev }}", -k, "-", sss, "{{ luks_clevis_sss | to_json }}"]
+    stdin: "{{ luks_passphrase }}"
+    stdin_add_newline: false
+  changed_when: true
+  no_log: true
+
+- name: "{{ luks_data_dev }} | Back up the LUKS header"
+  ansible.builtin.shell: >-
+    cryptsetup luksHeaderBackup {{ luks_data_dev }} --header-backup-file {{ luks_header_file }} &&
+    chmod 0400 {{ luks_header_file }}
+  args:
+    creates: "{{ luks_header_file }}"
+
+- name: "{{ luks_data_dev }} | Copy the header backup to the controller"
+  ansible.builtin.fetch:
+    src: "{{ luks_header_file }}"
+    dest: "{{ luks_keys_local_dir }}/{{ inventory_hostname }}/"
+    flat: true
+
+- name: "{{ luks_data_dev }} | Unlock through tang (proves network unlock works)"
+  ansible.builtin.command: clevis luks unlock -d {{ luks_data_dev }} -n {{ luks_name }}
+  args:
+    creates: "/dev/mapper/{{ luks_name }}"
+
+- name: "{{ luks_data_dev }} | Read LUKS UUID"
+  ansible.builtin.command: cryptsetup luksUUID {{ luks_data_dev }}
+  register: luks_uuid
+  changed_when: false
+
+- name: "{{ luks_data_dev }} | Add to /etc/crypttab (no key file: unlocked by tang)"
+  ansible.builtin.lineinfile:
+    path: /etc/crypttab
+    regexp: '^{{ luks_name | regex_escape }}\s'
+    line: "{{ luks_name }} UUID={{ luks_uuid.stdout }} none {{ luks_crypttab_opts }}"
+    create: true
+    owner: root
+    group: root
+    mode: "0600"
+
+- name: "{{ luks_data_dev }} | Filesystem and mount (new volumes only)"
+  when: luks_data_filesystem | length > 0
+  block:
+    - name: "{{ luks_data_dev }} | Create filesystem"
+      community.general.filesystem:
+        dev: "/dev/mapper/{{ luks_name }}"
+        fstype: "{{ luks_data_filesystem }}"
+
+    - name: "{{ luks_data_dev }} | Mount"
+      ansible.posix.mount:
+        path: "{{ luks_mount_path }}"
+        src: "/dev/mapper/{{ luks_name }}"
+        fstype: "{{ luks_data_filesystem }}"
+        opts: defaults,_netdev,nofail
+        state: mounted
+
+- name: "{{ luks_data_dev }} | Write recovery notes on the controller"
+  ansible.builtin.copy:
+    dest: "{{ luks_keys_local_dir }}/{{ inventory_hostname }}/{{ luks_name }}.yml"
+    mode: "0600"
+    content: "{{ {'type': 'data', 'device_at_setup': luks_data_dev, 'disk_id': luks_dev_id.stdout | trim, 'mapper': luks_name, 'luks_uuid': luks_uuid.stdout, 'key_file': luks_name ~ '.key', 'header_backup': luks_header_file | basename} | to_nice_yaml }}"
+  delegate_to: localhost
+  become: false

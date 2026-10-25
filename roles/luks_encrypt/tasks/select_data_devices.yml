@@ -1,0 +1,150 @@
+---
+# Read-only. Builds one fact, luks_disks, describing every block device
+# (whole disks AND md arrays), then decides what to do with each.
+#
+# To troubleshoot by hand on a server, run the same command:
+#   lsblk -J -d -b -o NAME,PATH,TYPE,SIZE,RM,FSTYPE,PTTYPE,LABEL,MOUNTPOINT
+
+- name: Data | Read every block device
+  ansible.builtin.command: lsblk -J -d -b -o NAME,PATH,TYPE,SIZE,RM,FSTYPE,PTTYPE,LABEL,MOUNTPOINT
+  register: luks_lsblk
+  changed_when: false
+  check_mode: false
+
+# state:
+#   encrypted - FSTYPE is crypto_LUKS (open or closed)
+#   in_use    - any filesystem/RAID member/LVM signature, a partition
+#               table, partitions, holders (e.g. part of md0) or mounted
+#   blank     - none of the above; the only state that can be formatted
+- name: Data | Work out the state of each device
+  ansible.builtin.set_fact:
+    luks_disks: "{{ luks_disks | default({}) | combine({item.path: item | combine({'state': luks_state})}) }}"
+  loop: "{{ (luks_lsblk.stdout | from_json).blockdevices }}"
+  loop_control:
+    label: "{{ item.path }}"
+  vars:
+    luks_fact: "{{ ansible_facts.devices[item.name] | default({}) }}"
+    luks_state: >-
+      {{ 'encrypted' if item.fstype == 'crypto_LUKS'
+         else 'in_use' if (item.fstype or item.pttype or item.mountpoint
+                           or (luks_fact.partitions | default({}) | length > 0)
+                           or (luks_fact.holders | default([]) | length > 0))
+         else 'blank' }}
+
+- name: Data | Device table
+  ansible.builtin.debug:
+    msg: >-
+      {%- set out = [] -%}
+      {%- for path, d in luks_disks | dictsort -%}
+        {%- if d.type in ['disk'] or d.type.startswith('raid') -%}
+          {%- set _ = out.append(path ~ '  ' ~ d.type ~ '  ' ~ ((d.size | int) / 10**12) | round(2) ~ 'TB  fstype=' ~ (d.fstype or '-') ~ '  label=' ~ (d.label or '-') ~ '  => ' ~ d.state) -%}
+        {%- endif -%}
+      {%- endfor -%}
+      {{ out }}
+
+# ---------------------------------------------------------------------
+# Candidates
+# ---------------------------------------------------------------------
+# realpath turns /dev/md/data into /dev/md127 and fails if missing.
+- name: Data | Resolve listed devices (raid / devices mode)
+  ansible.builtin.command: realpath -e {{ item }}
+  loop: "{{ luks_data_raid_devices if luks_data_mode == 'raid' else luks_data_devices }}"
+  register: luks_listed
+  changed_when: false
+  check_mode: false
+  when: luks_data_mode in ['raid', 'devices']
+
+- name: Data | Candidates from the list
+  ansible.builtin.set_fact:
+    luks_data_candidates: "{{ luks_listed.results | map(attribute='stdout') | list }}"
+  when: luks_data_mode in ['raid', 'devices']
+
+# Only TYPE=disk, so md arrays and their member disks never match here:
+# members show FSTYPE=linux_raid_member and would be in_use anyway.
+- name: Data | Candidates by size (dynamic mode)
+  ansible.builtin.set_fact:
+    luks_data_candidates: >-
+      {{ luks_disks | dict2items
+         | selectattr('value.type', 'equalto', 'disk')
+         | rejectattr('value.rm')
+         | selectattr('value.name', 'match', luks_data_include_regex)
+         | rejectattr('key', 'in', luks_data_exclude_devices)
+         | selectattr('value.size', 'ge', ((luks_data_min_size_tb | float) * 10**12) | int)
+         | selectattr('value.size', 'le', ((luks_data_max_size_tb | float) * 10**12) | int)
+         | map(attribute='key') | list }}
+  when: luks_data_mode == 'dynamic'
+
+- name: Data | Check the number of disks in the size window
+  ansible.builtin.assert:
+    that: luks_data_candidates | length == luks_data_expected_count | int
+    fail_msg: >-
+      Expected {{ luks_data_expected_count }} disks in the size window, found
+      {{ luks_data_candidates | length }}: {{ luks_data_candidates }}
+  when:
+    - luks_data_mode == 'dynamic'
+    - luks_data_expected_count | int > 0
+
+# ---------------------------------------------------------------------
+# Decide
+# ---------------------------------------------------------------------
+- name: Data | Sort candidates by state
+  ansible.builtin.set_fact:
+    luks_data_blank: "{{ luks_data_candidates | select('in', luks_disks | dict2items | selectattr('value.state', 'equalto', 'blank') | map(attribute='key') | list) | list }}"
+    luks_data_own: "{{ luks_data_candidates | select('in', luks_disks | dict2items | selectattr('value.state', 'equalto', 'encrypted') | selectattr('value.label', 'equalto', luks_label) | map(attribute='key') | list) | list }}"
+
+- name: Data | Final target lists
+  ansible.builtin.set_fact:
+    luks_data_targets: "{{ luks_data_blank if luks_allow_format | bool else [] }}"
+    luks_data_resume: "{{ luks_data_own if luks_resume_own_volumes | bool else [] }}"
+
+- name: Data | Record plan
+  ansible.builtin.set_fact:
+    luks_data_plan: >-
+      {%- set out = [] -%}
+      {%- for dev in luks_data_candidates -%}
+        {%- set d = luks_disks[dev] -%}
+        {%- if d.state == 'blank' -%}
+          {%- set act = 'ENCRYPT' if luks_allow_format | bool else 'blank, would encrypt (luks_allow_format is false)' -%}
+        {%- elif d.state == 'encrypted' and d.label == luks_label -%}
+          {%- set act = 'resume unfinished steps (no format)' if luks_resume_own_volumes | bool else 'skip: already encrypted by this role' -%}
+        {%- elif d.state == 'encrypted' -%}
+          {%- set act = 'skip: already encrypted' -%}
+        {%- else -%}
+          {%- set act = 'skip: in use (fstype=' ~ (d.fstype or '-') ~ ', pttype=' ~ (d.pttype or '-') ~ ')' -%}
+        {%- endif -%}
+        {%- set _ = out.append(dev ~ ': ' ~ act) -%}
+      {%- endfor -%}
+      {{ out | to_json }}
+
+# ---------------------------------------------------------------------
+# Software RAID checks (only for arrays about to be encrypted)
+# ---------------------------------------------------------------------
+- name: Data | Check RAID arrays are assembled and running
+  ansible.builtin.command: cat /sys/block/{{ item | basename }}/md/array_state
+  loop: "{{ luks_data_targets | select('match', '^/dev/md') | list }}"
+  register: luks_md_state
+  changed_when: false
+  check_mode: false
+  failed_when: luks_md_state.stdout | trim not in ['clean', 'active', 'active-idle']
+
+- name: Data | Check RAID arrays are listed in /etc/mdadm.conf
+  ansible.builtin.shell: |
+    set -o pipefail
+    uuid=$(mdadm --detail --export {{ item }} | sed -n 's/^MD_UUID=//p')
+    grep -qi "$uuid" /etc/mdadm.conf
+  args:
+    executable: /bin/bash
+  loop: "{{ luks_data_targets | select('match', '^/dev/md') | list }}"
+  register: luks_md_conf
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: Data | Warn about arrays missing from /etc/mdadm.conf
+  ansible.builtin.debug:
+    msg: >-
+      WARNING: {{ item.item }} is not in /etc/mdadm.conf. Add it
+      (mdadm --detail --scan >> /etc/mdadm.conf) so it always assembles at boot.
+  loop: "{{ luks_md_conf.results | default([]) | rejectattr('rc', 'equalto', 0) | list }}"
+  loop_control:
+    label: "{{ item.item }}"
