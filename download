@@ -1,0 +1,3 @@
+# Plaintext LUKS passphrases, header backups and tang keys.
+# Back this folder up somewhere safe; don't commit it unencrypted.
+luks-keys/
