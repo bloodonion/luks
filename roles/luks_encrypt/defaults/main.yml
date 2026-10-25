@@ -1,0 +1,89 @@
+---
+# =====================================================================
+# Safety (read this first)
+# =====================================================================
+# A device is only ever formatted when ALL of these are true:
+#   - lsblk + ansible facts say it is blank: not crypto_LUKS, no
+#     filesystem / RAID member / LVM signature, no partition table,
+#     no partitions, no holders (e.g. part of md0), not mounted
+#   - wipefs, reading the disk directly, finds nothing on it
+#   - its passphrase is already saved on the controller
+#   - luks_allow_format is true
+# Anything already encrypted or partitioned is skipped and reported.
+luks_allow_format: false
+
+# Report what would happen and stop. Changes nothing on the servers.
+luks_preview_only: false
+
+# Every volume this role formats gets this LUKS2 label.
+luks_label: ansible-luks
+
+# Already-encrypted volumes are skipped completely. If a run stopped
+# part way (e.g. tang was unreachable right after formatting), set
+# this to true to finish ONLY volumes carrying luks_label. It never
+# formats, wipes or creates filesystems: it only adds the tang
+# binding, crypttab line, header backup, unlock and mount.
+luks_resume_own_volumes: false
+
+# =====================================================================
+# Tang / Clevis. Everything unlocks over the network; no keys are
+# stored on the servers.
+# =====================================================================
+# List of {url, thp}; thp is the tang thumbprint.
+luks_tang_servers: []
+# How many tang servers must answer (sss threshold).
+luks_tang_threshold: 1
+
+# =====================================================================
+# OS volume (must already be LUKS from install time; never formatted)
+# =====================================================================
+# none | auto (find the LUKS device under /) | device (luks_os_device)
+luks_os_mode: none
+luks_os_device: ""
+
+# Passphrase the OS was installed with. Needed once, to enrol the
+# DR passphrase. Keep it in ansible-vault.
+luks_os_existing_passphrase: ""
+
+# Network in the initramfs so clevis can reach tang.
+luks_os_rd_neednet: true
+# Optional static IP for the initramfs, e.g.
+# "ip=10.0.0.20::10.0.0.1:255.255.255.0::ens3:none"
+luks_os_kernel_ip_arg: ""
+
+# =====================================================================
+# Data volumes
+# =====================================================================
+# none | raid | dynamic | devices
+luks_data_mode: none
+
+luks_data_raid_devices:
+  - /dev/md0
+
+luks_data_devices: []
+
+# Dynamic mode: decimal TB as on the drive label (1 TB = 10^12 bytes).
+luks_data_min_size_tb: 14
+luks_data_max_size_tb: 16
+luks_data_include_regex: '^(sd[a-z]+|nvme[0-9]+n[0-9]+|vd[a-z]+)$'
+luks_data_exclude_devices: []
+# Fail if the size window matches a different number of disks
+# (counted before skipping, so re-runs still pass). 0 = no check.
+luks_data_expected_count: 0
+
+# Mapper names: <prefix>-<disk WWN or serial>
+luks_data_name_prefix: data
+luks_data_discard: false
+
+# Optional filesystem, created only on volumes formatted in this run.
+luks_data_filesystem: ""
+luks_data_mount_base: /data
+luks_data_mount_overrides: {}
+
+# =====================================================================
+# Keys and disaster recovery (controller side)
+# =====================================================================
+luks_key_length: 64
+luks_keys_local_dir: "{{ playbook_dir }}/luks-keys"
+luks_remote_header_dir: /root/luks-header-backups
+luks_format_extra_args: []
