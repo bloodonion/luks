@@ -1,0 +1,16 @@
+---
+# Port tangd listens on (upstream default is 80).
+tang_port: 7500
+
+# Open the port in firewalld.
+tang_manage_firewall: true
+tang_firewalld_zone: public
+
+# Where tang keeps its keys.
+tang_key_dir: /var/db/tang
+
+# Copy tang's keys and thumbprint back to the controller for DR.
+# If tang's keys are lost, servers can still be unlocked with the
+# passphrases saved by luks_encrypt, just not automatically.
+tang_backup_keys: true
+tang_local_backup_dir: "{{ playbook_dir }}/luks-keys/tang"
