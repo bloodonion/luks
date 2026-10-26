@@ -1,0 +1,51 @@
+---
+# Read-only. For each device in bs_devices, compares its clevis
+# bindings with luks_tang_servers / luks_tang_threshold and merges the
+# result into luks_bind_states[device]:
+#   state:   none     - no tang binding at all
+#            current  - bound to exactly the configured tang servers
+#            outdated - bound to tang, but a different set of servers
+#   current: key slots matching the configuration
+#   old:     tang-only key slots that do not match (removed on update)
+# Slots using other pins (e.g. tpm2) are never touched.
+#
+# Troubleshoot by hand:  clevis luks list -d <device>
+- name: Tang | Read clevis bindings
+  ansible.builtin.command: clevis luks list -d {{ item }}
+  loop: "{{ bs_devices }}"
+  register: luks_bs_list
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: Tang | Compare with the configured servers
+  ansible.builtin.set_fact:
+    luks_bind_states: "{{ luks_bind_states | default({}) | combine({item.item: luks_bs_state | from_json}) }}"
+  loop: "{{ luks_bs_list.results }}"
+  loop_control:
+    label: "{{ item.item }}"
+  vars:
+    luks_bs_state: >-
+      {%- set ns = namespace(cur=[], old=[]) -%}
+      {%- for line in item.stdout_lines | default([]) -%}
+        {%- set m = line | regex_search("^([0-9]+):[ \t]+([^ \t]+)[ \t]+'(.*)'$", '\\1', '\\2', '\\3') -%}
+        {%- if m -%}
+          {%- set cfg = m[2] | from_json -%}
+          {%- if m[1] == 'sss' and (cfg.pins | default({})).keys() | list == ['tang'] -%}
+            {%- set urls = cfg.pins.tang | map(attribute='url') | sort | list -%}
+            {%- if (cfg.t | int) == (luks_tang_threshold | int) and urls == luks_tang_urls -%}
+              {%- set ns.cur = ns.cur + [m[0]] -%}
+            {%- else -%}
+              {%- set ns.old = ns.old + [m[0]] -%}
+            {%- endif -%}
+          {%- elif m[1] == 'tang' -%}
+            {%- if luks_tang_urls == [cfg.url] and (luks_tang_threshold | int) == 1 -%}
+              {%- set ns.cur = ns.cur + [m[0]] -%}
+            {%- else -%}
+              {%- set ns.old = ns.old + [m[0]] -%}
+            {%- endif -%}
+          {%- endif -%}
+        {%- endif -%}
+      {%- endfor -%}
+      {{ {'state': ('current' if ns.cur else ('outdated' if ns.old else 'none')),
+          'current': ns.cur, 'old': ns.old} | to_json }}
