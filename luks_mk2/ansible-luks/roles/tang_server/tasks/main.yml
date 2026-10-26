@@ -1,0 +1,113 @@
+---
+- name: Install tang and SELinux tooling
+  ansible.builtin.dnf:
+    name:
+      - tang
+      - policycoreutils-python-utils
+    state: present
+
+- name: Allow the tang port in SELinux
+  community.general.seport:
+    ports: "{{ tang_port | string }}"
+    proto: tcp
+    setype: tangd_port_t
+    state: present
+  when:
+    - tang_port | int != 80
+    - ansible_facts.selinux.status | default('disabled') == 'enabled'
+
+- name: Create tangd.socket drop-in directory
+  ansible.builtin.file:
+    path: /etc/systemd/system/tangd.socket.d
+    state: directory
+    mode: "0755"
+
+- name: Set the tang listen port
+  ansible.builtin.copy:
+    dest: /etc/systemd/system/tangd.socket.d/override.conf
+    mode: "0644"
+    content: |
+      [Socket]
+      ListenStream=
+      ListenStream={{ tang_port }}
+  notify: Restart tangd.socket
+
+- name: Look for existing tang keys
+  ansible.builtin.find:
+    paths: "{{ tang_key_dir }}"
+    patterns: "*.jwk"
+  register: tang_existing_keys
+
+- name: Generate tang keys
+  ansible.builtin.command: /usr/libexec/tangd-keygen {{ tang_key_dir }}
+  when: tang_existing_keys.matched == 0
+  changed_when: true
+
+- name: Make sure tang owns its key directory
+  ansible.builtin.file:
+    path: "{{ tang_key_dir }}"
+    owner: tang
+    group: tang
+    recurse: true
+
+- name: Enable and start tangd.socket
+  ansible.builtin.systemd_service:
+    name: tangd.socket
+    enabled: true
+    state: started
+    daemon_reload: true
+
+- name: Open the tang port in firewalld
+  ansible.posix.firewalld:
+    port: "{{ tang_port }}/tcp"
+    zone: "{{ tang_firewalld_zone }}"
+    permanent: true
+    immediate: true
+    state: enabled
+  when: tang_manage_firewall | bool
+
+- name: Apply pending restarts
+  ansible.builtin.meta: flush_handlers
+
+- name: Read the tang thumbprint
+  ansible.builtin.command: tang-show-keys {{ tang_port }}
+  register: tang_show_keys
+  changed_when: false
+
+- name: Record the thumbprint as a fact
+  ansible.builtin.set_fact:
+    tang_thumbprint: "{{ tang_show_keys.stdout_lines | first }}"
+
+- name: Back up tang thumbprint and keys to the controller
+  when: tang_backup_keys | bool
+  block:
+    - name: Create local backup directory
+      ansible.builtin.file:
+        path: "{{ tang_local_backup_dir }}/{{ inventory_hostname }}"
+        state: directory
+        mode: "0700"
+      delegate_to: localhost
+      become: false
+
+    - name: Save thumbprint (read by luks_servers group_vars)
+      ansible.builtin.copy:
+        dest: "{{ tang_local_backup_dir }}/{{ inventory_hostname }}.thp"
+        content: "{{ tang_thumbprint }}"
+        mode: "0600"
+      delegate_to: localhost
+      become: false
+
+    - name: List tang key files
+      ansible.builtin.find:
+        paths: "{{ tang_key_dir }}"
+        patterns: "*.jwk"
+      register: tang_keys
+
+    - name: Fetch tang key files
+      ansible.builtin.fetch:
+        src: "{{ item.path }}"
+        dest: "{{ tang_local_backup_dir }}/{{ inventory_hostname }}/"
+        flat: true
+      loop: "{{ tang_keys.files }}"
+      loop_control:
+        label: "{{ item.path | basename }}"
