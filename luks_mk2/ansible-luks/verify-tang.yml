@@ -1,0 +1,67 @@
+---
+# Read-only health check for network unlock. Changes nothing.
+#   ansible-playbook verify-tang.yml
+# For every encrypted server it shows which tang servers it can reach
+# and, for every LUKS volume, whether its binding covers both servers.
+- name: Tang servers are up
+  hosts: tang_servers
+  become: true
+  gather_facts: false
+  tasks:
+    - name: tangd.socket state
+      ansible.builtin.command: systemctl is-active tangd.socket
+      register: tang_active
+      changed_when: false
+      failed_when: false
+
+    - name: Report
+      ansible.builtin.debug:
+        msg: "{{ inventory_hostname }}: tangd.socket {{ tang_active.stdout }}"
+
+- name: Encrypted servers can unlock
+  hosts: luks_servers
+  become: true
+  gather_facts: false
+  tasks:
+    - name: Desired tang set
+      ansible.builtin.set_fact:
+        luks_tang_urls: "{{ luks_tang_servers | map(attribute='url') | sort | list }}"
+
+    - name: Reach each tang server from this host
+      ansible.builtin.uri:
+        url: "{{ item.url }}/adv"
+        timeout: 5
+      loop: "{{ luks_tang_servers }}"
+      loop_control:
+        label: "{{ item.url }}"
+      register: verify_reach
+      failed_when: false
+
+    - name: Find LUKS volumes
+      ansible.builtin.shell: lsblk -nlpo NAME,FSTYPE | awk '$2 == "crypto_LUKS" {print $1}' | sort -u
+      register: verify_luks
+      changed_when: false
+
+    - name: Check bindings
+      ansible.builtin.include_role:
+        name: luks_encrypt
+        tasks_from: binding_status.yml
+      vars:
+        bs_devices: "{{ verify_luks.stdout_lines }}"
+
+    - name: Summary
+      ansible.builtin.debug:
+        msg: >-
+          {{ ['tang reachable: ' ~ (verify_reach.results | selectattr('status', 'equalto', 200) | map(attribute='item.url') | join(', ') or 'NONE'),
+              'tang UNREACHABLE: ' ~ (verify_reach.results | rejectattr('status', 'equalto', 200) | map(attribute='item.url') | join(', ') or '-')]
+             + (luks_bind_states | default({}) | dict2items | map(attribute='key')
+                | zip(luks_bind_states | default({}) | dict2items | map(attribute='value.state'))
+                | map('join', ': ') | list) }}
+
+    - name: Fail if a volume would not unlock with only one tang server
+      ansible.builtin.assert:
+        that: luks_bind_states | default({}) | dict2items | rejectattr('value.state', 'equalto', 'current') | list | length == 0
+        fail_msg: >-
+          Volumes not bound to all configured tang servers:
+          {{ luks_bind_states | dict2items | rejectattr('value.state', 'equalto', 'current') | map(attribute='key') | list }}.
+          Run site.yml with -e luks_update_tang_bindings=true (or luks_resume_own_volumes=true if unbound).
