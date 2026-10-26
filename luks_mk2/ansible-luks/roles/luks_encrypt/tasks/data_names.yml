@@ -1,0 +1,26 @@
+---
+# Stable name per device: disk WWN, else disk serial, else md array UUID.
+# (md0 can come back as md127; its array UUID never changes.)
+- name: "{{ luks_data_dev }} | Find a stable identifier"
+  ansible.builtin.shell: |
+    dev="{{ luks_data_dev }}"
+    id=$(lsblk -dno WWN "$dev" 2>/dev/null | tr -d '[:space:]')
+    [ -z "$id" ] && id=$(lsblk -dno SERIAL "$dev" 2>/dev/null | tr -d '[:space:]')
+    if [ -z "$id" ] && [ -d "/sys/block/$(basename "$dev")/md" ]; then
+      id="md-$(mdadm --detail --export "$dev" | sed -n 's/^MD_UUID=//p')"
+    fi
+    [ -z "$id" ] && id=$(basename "$dev")
+    echo "$id"
+  register: luks_dev_id
+  changed_when: false
+
+- name: "{{ luks_data_dev }} | Set mapper name"
+  ansible.builtin.set_fact:
+    luks_name: "{{ luks_data_name_prefix }}-{{ luks_dev_id.stdout | trim | regex_replace('[^A-Za-z0-9_.-]', '_') }}"
+
+- name: "{{ luks_data_dev }} | Set key and header paths"
+  ansible.builtin.set_fact:
+    luks_local_key: "{{ luks_keys_local_dir }}/{{ inventory_hostname }}/{{ luks_name }}.key"
+    luks_header_file: "{{ luks_remote_header_dir }}/{{ luks_name }}.luksheader"
+    luks_mount_path: "{{ luks_data_mount_overrides[luks_data_dev] | default(luks_data_mount_base ~ '/' ~ luks_name) }}"
+    luks_crypttab_opts: "{{ (['luks', '_netdev', 'nofail'] + (['discard'] if luks_data_discard | bool else [])) | join(',') }}"

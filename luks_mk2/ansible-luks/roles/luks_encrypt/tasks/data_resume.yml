@@ -1,0 +1,98 @@
+---
+# Opt-in (luks_resume_own_volumes). Only volumes labelled luks_label.
+# Never formats, wipes or creates a filesystem.
+- name: "{{ luks_data_dev }} | Names"
+  ansible.builtin.include_tasks: data_names.yml
+
+- name: "{{ luks_data_dev }} | Is the key on the controller?"
+  ansible.builtin.stat:
+    path: "{{ luks_local_key }}"
+  register: luks_resume_key
+  delegate_to: localhost
+  become: false
+
+- name: "{{ luks_data_dev }} | Skip: no controller key"
+  ansible.builtin.debug:
+    msg: "Skipping {{ luks_data_dev }}: {{ luks_local_key }} not found on the controller."
+  when: not luks_resume_key.stat.exists
+
+- name: "{{ luks_data_dev }} | Resume"
+  when: luks_resume_key.stat.exists
+  block:
+    - name: "{{ luks_data_dev }} | Load passphrase"
+      ansible.builtin.set_fact:
+        luks_passphrase: "{{ lookup('ansible.builtin.file', luks_local_key) }}"
+      no_log: true
+
+    - name: "{{ luks_data_dev }} | Check the controller key opens it"
+      ansible.builtin.command:
+        argv: [cryptsetup, open, --test-passphrase, --key-file=-, "{{ luks_data_dev }}"]
+        stdin: "{{ luks_passphrase }}"
+        stdin_add_newline: false
+      changed_when: false
+      no_log: true
+
+    - name: "{{ luks_data_dev }} | Bind to tang if missing"
+      ansible.builtin.include_tasks: tang_bind.yml
+      vars:
+        tb_dev: "{{ luks_data_dev }}"
+        tb_pass: "{{ luks_passphrase }}"
+        tb_header: "{{ luks_header_file }}"
+
+    - name: "{{ luks_data_dev }} | Back up the LUKS header if missing"
+      ansible.builtin.shell: >-
+        cryptsetup luksHeaderBackup {{ luks_data_dev }} --header-backup-file {{ luks_header_file }} &&
+        chmod 0400 {{ luks_header_file }}
+      args:
+        creates: "{{ luks_header_file }}"
+
+    - name: "{{ luks_data_dev }} | Copy the header backup to the controller"
+      ansible.builtin.fetch:
+        src: "{{ luks_header_file }}"
+        dest: "{{ luks_keys_local_dir }}/{{ inventory_hostname }}/"
+        flat: true
+
+    - name: "{{ luks_data_dev }} | Unlock through tang if not open"
+      ansible.builtin.command: clevis luks unlock -d {{ luks_data_dev }} -n {{ luks_name }}
+      args:
+        creates: "/dev/mapper/{{ luks_name }}"
+
+    - name: "{{ luks_data_dev }} | Read LUKS UUID"
+      ansible.builtin.command: cryptsetup luksUUID {{ luks_data_dev }}
+      register: luks_uuid
+      changed_when: false
+
+    - name: "{{ luks_data_dev }} | Add to /etc/crypttab if missing"
+      ansible.builtin.lineinfile:
+        path: /etc/crypttab
+        regexp: '^{{ luks_name | regex_escape }}\s'
+        line: "{{ luks_name }} UUID={{ luks_uuid.stdout }} none {{ luks_crypttab_opts }}"
+        create: true
+        owner: root
+        group: root
+        mode: "0600"
+
+    - name: "{{ luks_data_dev }} | Check for an existing filesystem"
+      ansible.builtin.command: blkid -p -o value -s TYPE /dev/mapper/{{ luks_name }}
+      register: luks_resume_fs
+      changed_when: false
+      failed_when: luks_resume_fs.rc not in [0, 2]
+      when: luks_data_filesystem | length > 0
+
+    - name: "{{ luks_data_dev }} | Mount only if the expected filesystem is already there"
+      ansible.posix.mount:
+        path: "{{ luks_mount_path }}"
+        src: "/dev/mapper/{{ luks_name }}"
+        fstype: "{{ luks_data_filesystem }}"
+        opts: defaults,_netdev,nofail
+        state: mounted
+      when:
+        - luks_data_filesystem | length > 0
+        - luks_resume_fs.stdout | trim == luks_data_filesystem
+
+    - name: "{{ luks_data_dev }} | Note: filesystem not created on resume"
+      ansible.builtin.debug:
+        msg: "{{ luks_data_dev }}: no {{ luks_data_filesystem }} found on /dev/mapper/{{ luks_name }}; create it by hand if wanted."
+      when:
+        - luks_data_filesystem | length > 0
+        - luks_resume_fs.stdout | trim != luks_data_filesystem

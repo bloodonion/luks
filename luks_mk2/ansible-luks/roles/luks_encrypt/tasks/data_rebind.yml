@@ -1,0 +1,26 @@
+---
+# Opt-in (luks_update_tang_bindings). Only volumes labelled luks_label
+# that are already bound to a different tang setup. Touches key slots
+# only: adds the new binding, proves it, then removes the old one.
+- name: "{{ luks_data_dev }} | Names"
+  ansible.builtin.include_tasks: data_names.yml
+
+- name: "{{ luks_data_dev }} | Is the key on the controller?"
+  ansible.builtin.stat:
+    path: "{{ luks_local_key }}"
+  register: luks_rebind_key
+  delegate_to: localhost
+  become: false
+
+- name: "{{ luks_data_dev }} | Skip: no controller key"
+  ansible.builtin.debug:
+    msg: "Skipping {{ luks_data_dev }}: {{ luks_local_key }} not found on the controller, so it cannot be re-bound safely."
+  when: not luks_rebind_key.stat.exists
+
+- name: "{{ luks_data_dev }} | Move onto the configured tang servers"
+  ansible.builtin.include_tasks: tang_bind.yml
+  vars:
+    tb_dev: "{{ luks_data_dev }}"
+    tb_pass: "{{ lookup('ansible.builtin.file', luks_local_key) }}"
+    tb_header: "{{ luks_header_file }}"
+  when: luks_rebind_key.stat.exists

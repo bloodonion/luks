@@ -1,0 +1,149 @@
+---
+- name: Validate role settings
+  ansible.builtin.assert:
+    that:
+      - luks_os_mode in ['none', 'auto', 'device']
+      - luks_data_mode in ['none', 'raid', 'dynamic', 'devices']
+      - luks_os_mode != 'device' or (luks_os_device | length > 0)
+      - luks_data_mode != 'dynamic' or ((luks_data_min_size_tb | float) <= (luks_data_max_size_tb | float))
+      - luks_tang_servers | length > 0
+      - luks_tang_servers | selectattr('url', 'defined') | selectattr('thp', 'defined') | rejectattr('thp', 'equalto', '') | list | length == luks_tang_servers | length
+      - (luks_tang_threshold | int) >= 1
+      - (luks_tang_threshold | int) <= (luks_tang_servers | length)
+    fail_msg: >-
+      Invalid settings. Check luks_os_mode, luks_data_mode, the size window,
+      and that luks_tang_servers has entries with url and thp.
+
+- name: Install packages
+  ansible.builtin.dnf:
+    name:
+      - cryptsetup
+      - clevis
+      - clevis-luks
+      - clevis-dracut
+      - clevis-systemd
+      - mdadm
+    state: present
+
+- name: Build the clevis policy
+  ansible.builtin.set_fact:
+    # One expression, so t stays a number (clevis rejects "t": "1").
+    luks_clevis_sss: "{{ {'t': luks_tang_threshold | int, 'pins': {'tang': luks_tang_servers | map('dict2items') | map('selectattr', 'key', 'in', ['url', 'thp']) | map('items2dict') | list}} }}"
+    luks_tang_urls: "{{ luks_tang_servers | map(attribute='url') | sort | list }}"
+
+# Checked from each server, since that is where unlock happens.
+- name: Check each tang server is reachable from this host
+  ansible.builtin.uri:
+    url: "{{ item.url }}/adv"
+    timeout: 5
+  loop: "{{ luks_tang_servers }}"
+  loop_control:
+    label: "{{ item.url }}"
+  register: luks_tang_reach
+  failed_when: false
+  check_mode: false
+
+- name: Record unreachable tang servers
+  ansible.builtin.set_fact:
+    luks_tang_down: "{{ luks_tang_reach.results | rejectattr('status', 'equalto', 200) | map(attribute='item.url') | list }}"
+
+- name: Warn about unreachable tang servers
+  ansible.builtin.debug:
+    msg: >-
+      WARNING: {{ inventory_hostname }} cannot reach {{ luks_tang_down | join(', ') }}.
+      Unlock still works while {{ luks_tang_threshold }} server(s) answer, but
+      nothing will be bound or re-bound on this run.
+  when: luks_tang_down | length > 0
+
+- name: Inspect the OS volume (read-only)
+  ansible.builtin.include_tasks: os_detect.yml
+  when: luks_os_mode != 'none'
+
+- name: Inspect data volumes (read-only)
+  ansible.builtin.include_tasks: select_data_devices.yml
+  when: luks_data_mode != 'none'
+
+- name: Warn about key files left on the server
+  ansible.builtin.find:
+    paths: /etc/luks-keys
+    file_type: file
+  register: luks_stray_keys
+
+- name: Report stray key files (not removed automatically)
+  ansible.builtin.debug:
+    msg: >-
+      WARNING: {{ luks_stray_keys.matched }} file(s) in /etc/luks-keys. This role
+      stores no keys on servers. Check /etc/crypttab no longer references them,
+      then delete them by hand.
+  when: luks_stray_keys.matched | default(0) > 0
+
+- name: Plan for this host
+  ansible.builtin.debug:
+    msg: >-
+      {{ ['tang: ' ~ (luks_tang_servers | map(attribute='url') | join(', '))
+          ~ ' (any ' ~ luks_tang_threshold ~ ' can unlock)'
+          ~ ((', UNREACHABLE: ' ~ (luks_tang_down | join(', '))) if luks_tang_down | length > 0 else '')]
+         + (luks_os_plan | default([])) + (luks_data_plan | default([])) }}
+
+- name: Stop here in preview mode
+  ansible.builtin.meta: end_host
+  when: luks_preview_only | bool
+
+- name: Create header backup directory on the server
+  ansible.builtin.file:
+    path: "{{ luks_remote_header_dir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0700"
+
+- name: Create local DR directory for this host
+  ansible.builtin.file:
+    path: "{{ luks_keys_local_dir }}/{{ inventory_hostname }}"
+    state: directory
+    mode: "0700"
+  delegate_to: localhost
+  become: false
+
+- name: Configure the OS volume (adds key slots only, never formats)
+  ansible.builtin.include_tasks: os_configure.yml
+  when:
+    - luks_os_mode != 'none'
+    - luks_os_needs_work | bool
+
+- name: Encrypt blank data volumes
+  ansible.builtin.include_tasks: data_new.yml
+  loop: "{{ luks_data_targets | default([]) }}"
+  loop_control:
+    loop_var: luks_data_dev
+
+- name: Finish data volumes left half-done by an earlier run
+  ansible.builtin.include_tasks: data_resume.yml
+  loop: "{{ luks_data_resume | default([]) }}"
+  loop_control:
+    loop_var: luks_data_dev
+
+- name: Move data volumes onto the configured tang servers
+  ansible.builtin.include_tasks: data_rebind.yml
+  loop: "{{ luks_data_rebind | default([]) }}"
+  loop_control:
+    loop_var: luks_data_dev
+
+- name: Unlock non-root volumes through tang at boot
+  ansible.builtin.systemd_service:
+    name: "{{ item }}"
+    enabled: true
+  loop:
+    - clevis-luks-askpass.path
+    - remote-cryptsetup.target
+  when: luks_data_mode != 'none'
+
+- name: Lock down the local DR directory
+  ansible.builtin.file:
+    path: "{{ luks_keys_local_dir }}"
+    state: directory
+    recurse: true
+    mode: "u=rwX,go="
+  delegate_to: localhost
+  become: false
+  run_once: true

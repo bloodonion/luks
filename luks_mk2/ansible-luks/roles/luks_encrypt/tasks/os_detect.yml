@@ -1,0 +1,114 @@
+---
+# Read-only. Works out the OS volume and what (if anything) is left to do.
+- name: OS | Find the LUKS device under /
+  ansible.builtin.shell: |
+    set -o pipefail
+    src=$(findmnt -no SOURCE /)
+    lsblk -s -nlpo NAME,TYPE "$src" | awk 'f {print $1; exit} $2 == "crypt" {f = 1}'
+  args:
+    executable: /bin/bash
+  register: luks_os_detect
+  changed_when: false
+  check_mode: false
+  when: luks_os_mode == 'auto'
+
+- name: OS | Set the OS volume
+  ansible.builtin.set_fact:
+    luks_os_dev: "{{ (luks_os_detect.stdout | default('') | trim) if luks_os_mode == 'auto' else luks_os_device }}"
+
+- name: OS | Check it is LUKS
+  ansible.builtin.command: cryptsetup isLuks {{ luks_os_dev }}
+  register: luks_os_isluks
+  changed_when: false
+  failed_when: false
+  check_mode: false
+  when: luks_os_dev | length > 0
+
+- name: OS | Stop if the OS volume is not encrypted
+  ansible.builtin.fail:
+    msg: >-
+      {{ inventory_hostname }}: the OS volume ({{ luks_os_dev | default('none found', true) }})
+      is not LUKS. This role never encrypts an existing root in place. Reinstall
+      with kickstart/rocky10-luks-tang.ks, then re-run.
+  when: luks_os_dev | length == 0 or luks_os_isluks.rc != 0
+
+# Named by LUKS UUID, so the key still matches if md1 comes back as md127.
+- name: OS | Read LUKS UUID
+  ansible.builtin.command: cryptsetup luksUUID {{ luks_os_dev }}
+  register: luks_os_uuid
+  changed_when: false
+  check_mode: false
+
+- name: OS | Set names and paths
+  ansible.builtin.set_fact:
+    luks_os_name: "os-{{ luks_os_uuid.stdout | trim }}"
+
+- name: OS | Set key paths
+  ansible.builtin.set_fact:
+    luks_os_local_key: "{{ luks_keys_local_dir }}/{{ inventory_hostname }}/{{ luks_os_name }}.key"
+    luks_os_header_file: "{{ luks_remote_header_dir }}/{{ luks_os_name }}.luksheader"
+
+- name: OS | Is the DR key already on the controller?
+  ansible.builtin.stat:
+    path: "{{ luks_os_local_key }}"
+  register: luks_os_local_key_stat
+  delegate_to: localhost
+  become: false
+
+- name: OS | Does that key open the volume?
+  ansible.builtin.command:
+    argv: [cryptsetup, open, --test-passphrase, --key-file=-, "{{ luks_os_dev }}"]
+    stdin: "{{ lookup('ansible.builtin.file', luks_os_local_key) }}"
+    stdin_add_newline: false
+  register: luks_os_keytest
+  changed_when: false
+  failed_when: false
+  check_mode: false
+  no_log: true
+  when: luks_os_local_key_stat.stat.exists
+
+- name: OS | Is the kickstart install passphrase still enrolled?
+  ansible.builtin.command:
+    argv: [cryptsetup, open, --test-passphrase, --key-file=-, "{{ luks_os_dev }}"]
+    stdin: "{{ luks_os_existing_passphrase }}"
+    stdin_add_newline: false
+  register: luks_os_installtest
+  changed_when: false
+  failed_when: false
+  check_mode: false
+  no_log: true
+  when: luks_os_existing_passphrase | length > 0
+
+- name: OS | Check the tang binding
+  ansible.builtin.include_tasks: binding_status.yml
+  vars:
+    bs_devices: ["{{ luks_os_dev }}"]
+
+- name: OS | Work out state
+  ansible.builtin.set_fact:
+    luks_os_key_enrolled: "{{ luks_os_local_key_stat.stat.exists and (luks_os_keytest.rc | default(1)) == 0 }}"
+    luks_os_bound: "{{ luks_bind_states[luks_os_dev].state != 'none' }}"
+    luks_os_bind_state: "{{ luks_bind_states[luks_os_dev] }}"
+    luks_os_install_pass_present: "{{ (luks_os_installtest.rc | default(1)) == 0 }}"
+
+- name: OS | Decide whether there is anything to do
+  ansible.builtin.set_fact:
+    luks_os_needs_work: >-
+      {{ not (luks_os_key_enrolled | bool)
+         or not (luks_os_bound | bool)
+         or (luks_update_tang_bindings | bool and luks_os_bind_state.old | length > 0)
+         or (luks_os_install_pass_present | bool and luks_os_remove_install_passphrase | bool) }}
+
+- name: OS | Record plan
+  ansible.builtin.set_fact:
+    luks_os_plan:
+      - >-
+        OS {{ luks_os_dev }}:
+        DR key {{ 'present' if luks_os_key_enrolled | bool else 'will be added' }},
+        tang {{ {'current': 'bound to both' if luks_tang_servers | length > 1 else 'bound',
+                 'none': 'will be bound',
+                 'outdated': ('will be moved onto the configured servers' if luks_update_tang_bindings | bool
+                              else 'OUTDATED (run with -e luks_update_tang_bindings=true)')}[luks_os_bind_state.state] }}{{
+                 ', old binding will be removed' if (luks_os_bind_state.state == 'current' and luks_os_bind_state.old | length > 0 and luks_update_tang_bindings | bool) else '' }},
+        install passphrase {{ ('will be removed' if luks_os_remove_install_passphrase | bool else 'present (kept)') if luks_os_install_pass_present | bool else 'not present' }}
+        (never formatted){{ '' if luks_os_needs_work | bool else ' - nothing to do' }}

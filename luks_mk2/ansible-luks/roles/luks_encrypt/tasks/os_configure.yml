@@ -1,0 +1,168 @@
+---
+# Adds key slots and a tang binding only. Never formats the OS volume.
+- name: OS | Generate or load the DR passphrase (saved on the controller first)
+  ansible.builtin.set_fact:
+    luks_passphrase: "{{ lookup('ansible.builtin.password', luks_os_local_key ~ ' length=' ~ luks_key_length ~ ' chars=ascii_letters,digits') }}"
+  no_log: true
+
+- name: OS | Find the existing clevis key slot
+  ansible.builtin.shell: |
+    set -o pipefail
+    clevis luks list -d {{ luks_os_dev }} | awk -F: '/sss|tang/ {print $1; exit}'
+  args:
+    executable: /bin/bash
+  register: luks_os_slot_before
+  changed_when: false
+  when: luks_os_bound | bool
+
+# An existing key is needed to add one: tang (set up by the kickstart)
+# if bound, otherwise the install passphrase.
+- name: OS | Enrol the DR passphrase in a free key slot
+  when: not (luks_os_key_enrolled | bool)
+  block:
+    - name: OS | Need tang or the install passphrase to add a key
+      ansible.builtin.assert:
+        that: (luks_os_bound | bool) or (luks_os_install_pass_present | bool)
+        fail_msg: >-
+          Cannot add the DR key: the volume is not bound to tang and
+          luks_os_existing_passphrase does not open it.
+
+    - name: OS | Stage the DR passphrase in RAM (/run)
+      ansible.builtin.copy:
+        dest: /run/luks-os-new.key
+        content: "{{ luks_passphrase }}"
+        owner: root
+        group: root
+        mode: "0400"
+      no_log: true
+
+    - name: OS | Add the DR passphrase, unlocking with tang
+      ansible.builtin.shell: |
+        set -o pipefail
+        clevis luks pass -d {{ luks_os_dev }} -s {{ luks_os_slot_before.stdout | trim }} \
+          | cryptsetup luksAddKey --key-file=- {{ luks_os_dev }} /run/luks-os-new.key
+      args:
+        executable: /bin/bash
+      register: luks_os_added_tang
+      changed_when: true
+      when: luks_os_bound | bool
+
+    - name: OS | Add the DR passphrase, unlocking with the install passphrase
+      ansible.builtin.command:
+        argv: [cryptsetup, luksAddKey, --key-file=-, "{{ luks_os_dev }}", /run/luks-os-new.key]
+        stdin: "{{ luks_os_existing_passphrase }}"
+        stdin_add_newline: false
+      register: luks_os_added_pass
+      changed_when: true
+      no_log: true
+      when: not (luks_os_bound | bool)
+  always:
+    - name: OS | Remove staged passphrase
+      ansible.builtin.file:
+        path: /run/luks-os-new.key
+        state: absent
+
+- name: OS | Prove the DR passphrase opens the volume
+  ansible.builtin.command:
+    argv: [cryptsetup, open, --test-passphrase, --key-file=-, "{{ luks_os_dev }}"]
+    stdin: "{{ luks_passphrase }}"
+    stdin_add_newline: false
+  changed_when: false
+  no_log: true
+
+- name: OS | Bind to tang, or move onto the configured servers
+  ansible.builtin.include_tasks: tang_bind.yml
+  vars:
+    tb_dev: "{{ luks_os_dev }}"
+    tb_pass: "{{ luks_passphrase }}"
+
+- name: OS | Rebuild initramfs after a binding change
+  ansible.builtin.debug:
+    msg: Tang binding changed on the root volume; initramfs will be rebuilt.
+  changed_when: luks_tb_changed | bool
+  notify: Regenerate initramfs
+
+- name: OS | Find the clevis key slot
+  ansible.builtin.shell: |
+    set -o pipefail
+    clevis luks list -d {{ luks_os_dev }} | awk -F: '/sss|tang/ {print $1; exit}'
+  args:
+    executable: /bin/bash
+  register: luks_os_slot
+  changed_when: false
+
+- name: OS | Prove tang can unlock the volume
+  ansible.builtin.shell: |
+    set -o pipefail
+    clevis luks pass -d {{ luks_os_dev }} -s {{ luks_os_slot.stdout | trim }} \
+      | cryptsetup open --test-passphrase --key-file=- {{ luks_os_dev }}
+  args:
+    executable: /bin/bash
+  changed_when: false
+  no_log: true
+
+# Only after the DR key AND tang are both proven to work.
+- name: OS | Remove the kickstart install passphrase
+  when:
+    - luks_os_install_pass_present | bool
+    - luks_os_remove_install_passphrase | bool
+  block:
+    - name: OS | Stage the install passphrase in RAM (/run)
+      ansible.builtin.copy:
+        dest: /run/luks-os-install.key
+        content: "{{ luks_os_existing_passphrase }}"
+        owner: root
+        group: root
+        mode: "0400"
+      no_log: true
+
+    - name: OS | Remove its key slot
+      ansible.builtin.command: cryptsetup luksRemoveKey --batch-mode {{ luks_os_dev }} /run/luks-os-install.key
+      register: luks_os_removed
+      changed_when: true
+  always:
+    - name: OS | Remove staged install passphrase
+      ansible.builtin.file:
+        path: /run/luks-os-install.key
+        state: absent
+
+- name: OS | Check for a header backup
+  ansible.builtin.stat:
+    path: "{{ luks_os_header_file }}"
+  register: luks_os_header_stat
+
+- name: OS | Back up the LUKS header
+  ansible.builtin.shell: >-
+    rm -f {{ luks_os_header_file }} &&
+    cryptsetup luksHeaderBackup {{ luks_os_dev }} --header-backup-file {{ luks_os_header_file }} &&
+    chmod 0400 {{ luks_os_header_file }}
+  when: >-
+    (not luks_os_header_stat.stat.exists)
+    or (luks_os_added_tang is changed) or (luks_os_added_pass is changed)
+    or (luks_tb_changed | bool) or (luks_os_removed is changed)
+  changed_when: true
+
+- name: OS | Copy the header backup to the controller
+  ansible.builtin.fetch:
+    src: "{{ luks_os_header_file }}"
+    dest: "{{ luks_keys_local_dir }}/{{ inventory_hostname }}/"
+    flat: true
+
+- name: OS | Read kernel arguments
+  ansible.builtin.command: grubby --info=ALL
+  register: luks_grubby
+  changed_when: false
+
+- name: OS | Bring up networking in the initramfs
+  ansible.builtin.command: grubby --update-kernel=ALL --args="{{ item }}"
+  loop: "{{ (['rd.neednet=1'] if luks_os_rd_neednet | bool else []) + ([luks_os_kernel_ip_arg] if luks_os_kernel_ip_arg | length > 0 else []) }}"
+  when: luks_grubby.stdout_lines | select('match', '^args=') | reject('search', item | regex_escape) | list | length > 0
+  changed_when: true
+
+- name: OS | Write recovery notes on the controller
+  ansible.builtin.copy:
+    dest: "{{ luks_keys_local_dir }}/{{ inventory_hostname }}/{{ luks_os_name }}.yml"
+    mode: "0600"
+    content: "{{ {'type': 'os', 'device_at_setup': luks_os_dev, 'luks_uuid': luks_os_uuid.stdout | trim, 'key_file': luks_os_name ~ '.key', 'header_backup': luks_os_header_file | basename, 'tang_servers': luks_tang_servers | map(attribute='url') | list} | to_nice_yaml }}"
+  delegate_to: localhost
+  become: false

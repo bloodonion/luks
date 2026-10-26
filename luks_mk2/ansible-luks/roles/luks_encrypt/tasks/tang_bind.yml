@@ -1,0 +1,124 @@
+---
+# Binds tb_dev to the configured tang servers, or moves an outdated
+# binding onto them. Never formats. Inputs:
+#   tb_dev     device
+#   tb_pass    a passphrase that opens the device (the DR key)
+#   tb_header  (optional) header backup path to refresh when changed
+# Uses luks_bind_states[tb_dev] from binding_status.yml.
+# Sets luks_tb_changed.
+- name: "{{ tb_dev }} | Tang | Decide"
+  ansible.builtin.set_fact:
+    luks_tb_state: "{{ luks_bind_states[tb_dev] | default({'state': 'none', 'current': [], 'old': []}) }}"
+    luks_tb_changed: false
+    luks_tb_new_slot: ""
+
+- name: "{{ tb_dev }} | Tang | Work out actions"
+  ansible.builtin.set_fact:
+    luks_tb_do_bind: >-
+      {{ luks_tb_state.state == 'none'
+         or (luks_tb_state.state == 'outdated' and luks_update_tang_bindings | bool) }}
+    luks_tb_do_unbind: >-
+      {{ luks_tb_state.old | length > 0 and luks_update_tang_bindings | bool }}
+
+- name: "{{ tb_dev }} | Tang | Report outdated binding (not changed)"
+  ansible.builtin.debug:
+    msg: >-
+      {{ tb_dev }} is bound to a different tang setup than configured
+      (slots {{ luks_tb_state.old | join(', ') }}). Re-run with
+      -e luks_update_tang_bindings=true to move it onto
+      {{ luks_tang_urls | join(' + ') }}.
+  when:
+    - luks_tb_state.old | length > 0
+    - not (luks_update_tang_bindings | bool)
+
+- name: "{{ tb_dev }} | Tang | Bind and verify"
+  when: luks_tb_do_bind | bool
+  block:
+    - name: "{{ tb_dev }} | Tang | Every tang server must be reachable to bind"
+      ansible.builtin.assert:
+        that: luks_tang_down | length == 0
+        fail_msg: >-
+          Cannot bind {{ tb_dev }}: tang unreachable from {{ inventory_hostname }}:
+          {{ luks_tang_down | join(', ') }}. Nothing was changed on this volume.
+
+    - name: "{{ tb_dev }} | Tang | Prove the DR key opens the volume first"
+      ansible.builtin.command:
+        argv: [cryptsetup, open, --test-passphrase, --key-file=-, "{{ tb_dev }}"]
+        stdin: "{{ tb_pass }}"
+        stdin_add_newline: false
+      changed_when: false
+      no_log: true
+
+    - name: "{{ tb_dev }} | Tang | Key slots before"
+      ansible.builtin.shell: |
+        set -o pipefail
+        clevis luks list -d {{ tb_dev }} 2>/dev/null | cut -d: -f1 || true
+      args:
+        executable: /bin/bash
+      register: luks_tb_before
+      changed_when: false
+
+    - name: "{{ tb_dev }} | Tang | Add binding to {{ luks_tang_urls | join(' + ') }}"
+      ansible.builtin.command:
+        argv: [clevis, luks, bind, -y, -d, "{{ tb_dev }}", -k, "-", sss, "{{ luks_clevis_sss | to_json }}"]
+        stdin: "{{ tb_pass }}"
+        stdin_add_newline: false
+      changed_when: true
+      no_log: true
+
+    - name: "{{ tb_dev }} | Tang | Key slots after"
+      ansible.builtin.shell: |
+        set -o pipefail
+        clevis luks list -d {{ tb_dev }} | cut -d: -f1
+      args:
+        executable: /bin/bash
+      register: luks_tb_after
+      changed_when: false
+
+    - name: "{{ tb_dev }} | Tang | Find the new slot"
+      ansible.builtin.set_fact:
+        luks_tb_new_slot: "{{ (luks_tb_after.stdout_lines | difference(luks_tb_before.stdout_lines)) | first }}"
+        luks_tb_changed: true
+
+    - name: "{{ tb_dev }} | Tang | Prove the new binding unlocks the volume"
+      ansible.builtin.shell: |
+        set -o pipefail
+        clevis luks pass -d {{ tb_dev }} -s {{ luks_tb_new_slot }} \
+          | cryptsetup open --test-passphrase --key-file=- {{ tb_dev }}
+      args:
+        executable: /bin/bash
+      changed_when: false
+      no_log: true
+
+# Only reached once the new binding is proven (or was already current).
+- name: "{{ tb_dev }} | Tang | Remove old tang bindings"
+  ansible.builtin.command: clevis luks unbind -f -d {{ tb_dev }} -s {{ item }}
+  loop: "{{ luks_tb_state.old }}"
+  when:
+    - luks_tb_do_unbind | bool
+    - (luks_tb_state.current | length > 0) or (luks_tb_new_slot | length > 0)
+  register: luks_tb_unbound
+  changed_when: true
+
+- name: "{{ tb_dev }} | Tang | Note change"
+  ansible.builtin.set_fact:
+    luks_tb_changed: true
+  when: luks_tb_unbound is changed
+
+- name: "{{ tb_dev }} | Tang | Refresh the header backup"
+  when:
+    - tb_header is defined
+    - luks_tb_changed | bool
+  block:
+    - name: "{{ tb_dev }} | Tang | Write header backup"
+      ansible.builtin.shell: >-
+        rm -f {{ tb_header }} &&
+        cryptsetup luksHeaderBackup {{ tb_dev }} --header-backup-file {{ tb_header }} &&
+        chmod 0400 {{ tb_header }}
+      changed_when: true
+
+    - name: "{{ tb_dev }} | Tang | Copy header backup to the controller"
+      ansible.builtin.fetch:
+        src: "{{ tb_header }}"
+        dest: "{{ luks_keys_local_dir }}/{{ inventory_hostname }}/"
+        flat: true
