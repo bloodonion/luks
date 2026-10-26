@@ -1,0 +1,12 @@
+---
+- name: Tang key server
+  hosts: tang_servers
+  become: true
+  roles:
+    - tang_server
+
+- name: LUKS encryption
+  hosts: luks_servers
+  become: true
+  roles:
+    - luks_encrypt
