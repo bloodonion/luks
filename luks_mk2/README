@@ -1,0 +1,149 @@
+# LUKS + Tang for Rocky Linux 10 (re-runnable, network unlock only)
+
+- **tang_server**: Tang key servers, two of them (`tang01`, `tang02`): port, SELinux, firewalld. Saves each one's thumbprint and keys to `luks-keys/tang/`.
+- **luks_encrypt**: encrypts blank data volumes, binds OS and data volumes to Tang, and saves every passphrase and LUKS header backup to `luks-keys/<host>/`. **No keys are stored on the servers**; everything unlocks over the network.
+
+## How a disk is judged
+
+One read-only command builds the `luks_disks` fact for every whole disk **and** md array:
+
+```bash
+lsblk -J -d -b -o NAME,PATH,TYPE,SIZE,RM,FSTYPE,PTTYPE,LABEL,MOUNTPOINT
+```
+
+Combined with `ansible_facts.devices` (partitions and holders), each device gets one state:
+
+| State | Meaning | Action |
+|---|---|---|
+| `encrypted` | FSTYPE is `crypto_LUKS` (open or closed) | skip |
+| `in_use` | any filesystem, RAID member, LVM, partition table, partitions, holders, or mounted | skip |
+| `blank` | none of the above | encrypt, if `luks_allow_format=true` |
+
+Every run prints this as a table, so you can compare it with the same `lsblk` command run by hand on the server.
+
+Right before `luksFormat`, `wipefs --no-act` reads the disk directly (not udev's cache). If it finds anything at all, the format is stopped.
+
+## Software RAID
+
+- `raid` mode targets the array (`/dev/md0`), never its member disks. `/dev/md/<name>` paths are resolved with `realpath`.
+- Member disks show `FSTYPE=linux_raid_member` and have the array as a holder, so `dynamic` mode never picks them, even if they're in the size window. Arrays themselves are `TYPE=raid*`, so `dynamic` mode never picks those either.
+- Before encrypting an array the role checks it's assembled and running (`/sys/block/mdX/md/array_state`), and warns if it's missing from `/etc/mdadm.conf`.
+- Arrays are named by their md UUID (`data-md-<uuid>`), so keys still match if `md0` comes back as `md127`.
+- The OS volume on RAID (e.g. `/dev/md1`) is found automatically by `luks_os_mode: auto`.
+
+## Running it
+
+```bash
+ansible-galaxy collection install -r requirements.yml
+cp inventory/group_vars/luks_servers/vault.yml.example inventory/group_vars/luks_servers/vault.yml
+ansible-vault encrypt inventory/group_vars/luks_servers/vault.yml
+
+ansible-playbook site.yml --limit tang_servers                                         # 1. both Tang servers
+ansible-playbook site.yml --limit luks_servers -e luks_preview_only=true --ask-vault-pass  # 2. see the plan
+ansible-playbook site.yml --limit luks_servers -e luks_allow_format=true --ask-vault-pass  # 3. do it
+```
+
+ansible-playbook verify-tang.yml   # any time: read-only health check of network unlock
+
+The plan prints one line per device, e.g. `/dev/sdb: ENCRYPT`, `/dev/sdc: skip: already encrypted by this role`, `/dev/sdd: skip: in use (fstype=xfs, pttype=-)`.
+
+## Data volume selection
+
+| `luks_data_mode` | Targets |
+|---|---|
+| `raid` | `luks_data_raid_devices` (default `/dev/md0`) |
+| `dynamic` | Disks between `luks_data_min_size_tb` and `luks_data_max_size_tb` (decimal TB) |
+| `devices` | `luks_data_devices` |
+
+`luks_data_expected_count` counts disks in the size window before skipping, so it still passes on re-runs.
+
+## Two Tang servers and failover
+
+`tang01` and `tang02` are **independent**: each has its own keys, and neither knows about the other. Every volume is bound to **both** with a Clevis `sss` policy and threshold 1:
+
+```json
+{"t": 1, "pins": {"tang": [{"url": "http://10.0.0.5:7500", "thp": "..."}, {"url": "http://10.0.0.6:7500", "thp": "..."}]}}
+```
+
+At boot Clevis asks both, and **any one answer unlocks the volume**. If `tang01` is down, `tang02` unlocks everything, and the reverse. There's no load balancer or shared address, so there's nothing in front of the Tang servers that can fail, and no keys to keep in sync between them.
+
+Keep them apart (different hosts, racks, power and switches if you can), and keep them away from the storage servers.
+
+How each part copes with a Tang server being down:
+
+| When | One Tang down | Both down |
+|---|---|---|
+| Boot | Unlocks via the other | Root waits at the console for the DR key; data volumes stay locked, boot isn't blocked |
+| Kickstart install | Binds to the one that's up and warns; Ansible later reports it as outdated | Install finishes unbound; Ansible binds it later |
+| Ansible run | Warns, and won't bind or re-bind anything (a new binding must include both). Volumes already bound are left alone | Same |
+
+### Moving existing servers onto both
+
+Servers already bound to only one Tang server show up in the plan as `tang binding OUTDATED`. Nothing changes until you ask:
+
+```bash
+ansible-playbook site.yml --limit luks_servers -e luks_update_tang_bindings=true --ask-vault-pass
+```
+
+For each volume this touches key slots only, never data, in this order:
+
+1. Proves the DR key from `luks-keys/` opens the volume.
+2. Adds a new binding to both Tang servers (both must be reachable).
+3. Proves the new binding unlocks the volume.
+4. Only then removes the old Tang binding, and refreshes the header backup.
+
+Non-Tang slots (a TPM2 binding, say) are left alone, and re-running changes nothing. For data volumes this only applies to volumes this role formatted (label `ansible-luks`), since those are the ones with keys on the controller.
+
+### Testing failover
+
+Do this on one test server:
+
+```bash
+ansible-playbook verify-tang.yml --limit store01,tang_servers   # all "current"?
+# on tang01:  systemctl stop tangd.socket
+# reboot store01; it should come up unlocked, via tang02
+# on tang01:  systemctl start tangd.socket; then repeat with tang02 stopped
+```
+
+### How unlock works
+
+- **Root**: the initramfs brings up the network (`rd.neednet=1`), Clevis asks Tang, root unlocks. The role proves this works on each run with `clevis luks pass`.
+- **Data**: crypttab entries use `none` with `_netdev,nofail`; `clevis-luks-askpass` unlocks them from Tang after the network is up.
+
+## If a run stops part way
+
+Volumes formatted by this role carry the LUKS2 label `ansible-luks`. If a run failed after formatting (for example Tang was unreachable), re-run with `-e luks_resume_own_volumes=true`. That finishes only those volumes: Tang binding, header backup, crypttab, unlock, and mount if the filesystem already exists. It never formats or creates filesystems.
+
+## OS install (kickstart)
+
+`kickstart/rocky10-luks-tang.ks` installs the OS onto encrypted disks and binds them to Tang, so the first boot already unlocks over the network.
+
+Edit the **SETTINGS** block at the top of `%pre` (OS disk size window, install passphrase, both Tang URLs and thumbprints), and replace the example `YOUR SETTINGS` section with what your ISO already uses. The thumbprints are in `luks-keys/tang/tang01.thp` and `tang02.thp` after the `tang_server` role has run.
+
+What it does:
+
+1. **`%pre` picks the OS disks**: whole disks inside `OS_DISK_MIN_GB`–`OS_DISK_MAX_GB`, not removable, not USB. One disk gives a plain layout, two give mdadm RAID1. Any other count stops the install. `OS_DISKS_OVERRIDE` skips detection.
+2. **Data disks are invisible to the installer** (`ignoredisk --only-use`), and `clearpart` only touches the OS disks. The install also stops if a chosen disk holds an `ansible-luks` data volume, or is part of an md array that uses other disks too.
+3. **Layout**: EFI (or BIOS boot), `/boot`, then a LUKS2 volume holding LVM (`rl/root`, `rl/swap`). On RAID1, `/boot/efi`, `/boot` and the LUKS volume are all mirrored.
+4. **`%post` binds the LUKS volume to both Tang servers**, verifies the binding, adds `rd.neednet=1` (plus `ip=...` when the install used a static IP) and rebuilds the initramfs. It then removes the install passphrase from files left in `/root`.
+
+If one Tang server can't be reached during install, the volume is bound to the other and the install log warns; run Ansible with `-e luks_update_tang_bindings=true` to add the missing one. If neither can be reached, the install still finishes unbound, and the server asks for the install passphrase at the console until you run Ansible, which binds it.
+
+**After install, run Ansible.** It adds its own DR passphrase (unlocking through Tang), backs up the header, and then **removes the install passphrase** from the disk (`luks_os_remove_install_passphrase: true`), but only after both the DR key and Tang are proven to work. Put the same install passphrase in `vault.yml` as `luks_os_existing_passphrase`.
+
+The install passphrase is plain text inside the ISO, which is why it's removed afterwards. Keep the ISO itself somewhere restricted.
+
+## Disaster recovery
+
+Each volume has `<name>.key`, `<name>.luksheader` and `<name>.yml` (device, disk WWN/serial, LUKS UUID) in `luks-keys/<host>/`.
+
+```bash
+cryptsetup open --key-file data-XXXX.key /dev/sdX data-XXXX
+cryptsetup luksHeaderRestore /dev/sdX --header-backup-file data-XXXX.luksheader
+```
+
+`luks-keys/` is in `.gitignore`. Back it up, encrypted:
+
+```bash
+tar czf - luks-keys | gpg --symmetric -o luks-keys.tgz.gpg
+```
