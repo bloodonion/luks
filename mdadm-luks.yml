@@ -1,4 +1,13 @@
 ---
+# testing recovery 
+# cryptsetup luksDump /dev/md0       # "Keyslots:" lists 0 and 1; "Tokens:" shows clevis using slot 1
+# clevis luks list -d /dev/md0       # which slot clevis/Tang uses
+# cryptsetup open --test-passphrase -S 0 --key-file luks-keys/store01/md0-XXXX.key /dev/md0 && echo "key opens slot 0"
+
+# cryptsetup open --key-file store01/data-XXXX.key /dev/sdb disk1
+
+
+
 # =====================================================================
 # md0-raid-luks.yml
 #
