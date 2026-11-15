@@ -1,0 +1,570 @@
+---
+# =====================================================================
+# md0-raid-luks.yml
+#
+# Builds /dev/md0 from the disks you select by size, at the RAID level
+# you choose, then encrypts md0 with LUKS2 bound to your tang servers
+# so it unlocks over the network at boot.
+#
+# Safe to re-run:
+#   - md0 already exists      -> no disks are touched, no array created
+#   - md0 already LUKS        -> never formatted again
+#   - a disk has partitions, a filesystem, RAID/LVM membership, any
+#     signature, or is mounted -> it is never used
+#   - nothing is created or formatted unless you pass -e md0_create=true
+#
+# ---------------------------------------------------------------------
+# Settings (set per group in group_vars, per host in host_vars, or -e)
+# ---------------------------------------------------------------------
+# Required:
+#   md0_disk_size: 14         # the size lsblk prints, e.g. 14 matches
+#                             # 14T and 14.6T. Use 14.6 to match exactly.
+#   md0_raid_level: 10        # 1, 5, 6 or 10
+#   md0_tang_servers:         # defaults to luks_tang_servers if you have it
+#     - url: http://10.0.0.5:7500
+#       thp: <thumbprint>     # tang-show-keys 7500 on the tang server
+#     - url: http://10.0.0.6:7500
+#       thp: <thumbprint>
+#
+# Optional:
+#   md0_disk_size_unit: T     # unit letter lsblk prints (T, G)
+#   md0_disk_count: 16        # fail unless exactly this many blank disks
+#                             # match (strongly recommended)
+#   md0_exclude: []           # e.g. ['/dev/sdq']
+#   md0_tang_threshold: 1     # any 1 tang server can unlock
+#   md0_mapper_name: md0_crypt
+#   md0_luks_label: md0
+#   md0_filesystem: ""        # e.g. xfs, to create a filesystem (only on
+#   md0_fs_label: ""          #   a brand-new, empty volume) and mount it
+#   md0_mount_point: ""       #   at md0_mount_point, e.g. /data
+#   md0_keys_dir: <playbook_dir>/luks-keys/<host>   # DR key + header
+#
+# ---------------------------------------------------------------------
+# Usage
+# ---------------------------------------------------------------------
+#   # 1. see which disks would be used (changes nothing)
+#   ansible-playbook md0-raid-luks.yml --limit store01 -e md0_preview=true
+#   # 2. build and encrypt
+#   ansible-playbook md0-raid-luks.yml --limit store01 -e md0_create=true
+#
+# Troubleshoot disk selection by hand on the server:
+#   LC_ALL=C lsblk -o NAME,SIZE,TYPE,FSTYPE,PTTYPE,MOUNTPOINT
+# =====================================================================
+- name: Build md0 from selected disks and encrypt it with tang
+  hosts: "{{ md0_hosts | default('md0_servers') }}"
+  become: true
+  gather_facts: false
+
+  handlers:
+    - name: Regenerate initramfs
+      ansible.builtin.command: dracut -f --regenerate-all
+      changed_when: true
+
+  tasks:
+    # =================================================================
+    # Settings
+    # =================================================================
+    - name: Settings
+      ansible.builtin.set_fact:
+        md0_size: "{{ md0_disk_size | default('') | string }}"
+        md0_unit: "{{ md0_disk_size_unit | default('T') | upper }}"
+        md0_level: "{{ md0_raid_level | default('') | string | regex_replace('^raid', '') }}"
+        md0_count: "{{ md0_disk_count | default(0) | int }}"
+        md0_excl: "{{ md0_exclude | default([]) }}"
+        md0_tang: "{{ md0_tang_servers | default(luks_tang_servers | default([])) }}"
+        md0_t: "{{ md0_tang_threshold | default(luks_tang_threshold | default(1)) | int }}"
+        md0_mapper: "{{ md0_mapper_name | default('md0_crypt') }}"
+        md0_label: "{{ md0_luks_label | default('md0') }}"
+        md0_fs: "{{ md0_filesystem | default('') }}"
+        md0_fslabel: "{{ md0_fs_label | default('') }}"
+        md0_mnt: "{{ md0_mount_point | default('') }}"
+        md0_keys: "{{ md0_keys_dir | default(playbook_dir ~ '/luks-keys/' ~ inventory_hostname) }}"
+        md0_is_preview: "{{ md0_preview | default(false) | bool }}"
+        md0_may_create: "{{ md0_create | default(false) | bool }}"
+
+    - name: Check settings
+      ansible.builtin.assert:
+        that:
+          - md0_size is match('^[0-9]+(\.[0-9]+)?$')
+          - md0_level in ['1', '5', '6', '10']
+          - md0_tang | length > 0
+          - md0_tang | selectattr('url', 'defined') | list | length == md0_tang | length
+          - md0_t | int >= 1 and md0_t | int <= md0_tang | length
+          - md0_fs == '' or md0_mnt is match('^/.+')
+        fail_msg: >-
+          Set md0_disk_size (e.g. 14), md0_raid_level (1, 5, 6 or 10) and
+          md0_tang_servers (url + thp). md0_mount_point is needed with md0_filesystem.
+
+    - name: Warn about tang servers without a thumbprint
+      ansible.builtin.debug:
+        msg: >-
+          WARNING: no thp for {{ md0_tang | rejectattr('thp', 'defined') | map(attribute='url') | list }}.
+          The binding will trust whatever key that server advertises right now.
+          Add thp (tang-show-keys <port> on the tang server) to pin it.
+      when: md0_tang | rejectattr('thp', 'defined') | list | length > 0
+
+    - name: Install packages
+      ansible.builtin.dnf:
+        name: [mdadm, cryptsetup, clevis, clevis-luks, clevis-systemd, clevis-dracut]
+        state: present
+      when: md0_install_packages | default(true) | bool
+
+    # =================================================================
+    # Current state (read-only)
+    # =================================================================
+    - name: Does /dev/md0 exist?
+      ansible.builtin.stat:
+        path: /dev/md0
+      register: md0_stat
+
+    - name: Running arrays
+      ansible.builtin.command: mdadm --detail --scan
+      register: md0_running
+      changed_when: false
+      check_mode: false
+
+    - name: Arrays recorded on disks (running or not)
+      ansible.builtin.command: mdadm --examine --scan
+      register: md0_ondisk
+      changed_when: false
+      failed_when: false
+      check_mode: false
+
+    - name: Read disks
+      ansible.builtin.command: lsblk -J -o NAME,PATH,SIZE,TYPE,RM,FSTYPE,PTTYPE,MOUNTPOINT
+      environment:
+        LC_ALL: C
+      register: md0_lsblk
+      changed_when: false
+      check_mode: false
+
+    # =================================================================
+    # Disk selection and array creation (only when md0 doesn't exist)
+    # =================================================================
+    - name: Select disks and create md0
+      when: not md0_stat.stat.exists
+      block:
+        # An array that exists on the disks but isn't running would be
+        # destroyed by creating a new one over it.
+        - name: Stop if an array exists on the disks but is not running
+          ansible.builtin.assert:
+            that: md0_notrunning | length == 0
+            fail_msg: >-
+              These arrays are recorded on disks but not running: {{ md0_notrunning }}.
+              Assemble them (mdadm --assemble --scan) instead of creating a new one.
+              Nothing was changed.
+          vars:
+            md0_notrunning: >-
+              {{ md0_ondisk.stdout | regex_findall('UUID=([0-9A-Fa-f:]+)')
+                 | reject('in', md0_running.stdout | regex_findall('UUID=([0-9A-Fa-f:]+)'))
+                 | unique | list }}
+
+        # One row per whole disk: size as lsblk prints it, and why it can
+        # or can't be used. Children = partitions, RAID or LVM on it.
+        - name: Judge each disk
+          ansible.builtin.set_fact:
+            md0_disks: >-
+              {%- set out = [] -%}
+              {%- for d in (md0_lsblk.stdout | from_json).blockdevices if d.type == 'disk' -%}
+                {%- set m = (d.size | string) | regex_findall('^([0-9.]+)([A-Za-z])$') -%}
+                {%- set num = (m[0][0] | float) if m else 0 -%}
+                {%- set unit = (m[0][1] | upper) if m else '' -%}
+                {%- if '.' in md0_size -%}
+                  {%- set size_ok = unit == md0_unit and num == (md0_size | float) -%}
+                {%- else -%}
+                  {%- set size_ok = unit == md0_unit and (num | int) == (md0_size | int) -%}
+                {%- endif -%}
+                {%- if not size_ok -%}
+                  {%- set state = 'other size' -%}
+                {%- elif d.path in md0_excl -%}
+                  {%- set state = 'excluded' -%}
+                {%- elif d.rm in [true, '1', 1] -%}
+                  {%- set state = 'in use: removable' -%}
+                {%- elif d.children | default([]) | length > 0 -%}
+                  {%- set state = 'in use: has ' ~ (d.children | map(attribute='type') | unique | join('/')) ~ ' on it (' ~ (d.children | map(attribute='name') | join(', ')) ~ ')' -%}
+                {%- elif d.fstype -%}
+                  {%- set state = 'in use: ' ~ d.fstype -%}
+                {%- elif d.pttype -%}
+                  {%- set state = 'in use: ' ~ d.pttype ~ ' partition table' -%}
+                {%- elif d.mountpoint -%}
+                  {%- set state = 'in use: mounted at ' ~ d.mountpoint -%}
+                {%- else -%}
+                  {%- set state = 'blank' -%}
+                {%- endif -%}
+                {%- set _ = out.append({'path': d.path, 'size': d.size, 'state': state}) -%}
+              {%- endfor -%}
+              {{ out }}
+
+        # lsblk relies on udev's cache; wipefs reads the disk itself.
+        - name: Double-check blank disks straight from the disk
+          ansible.builtin.command: wipefs --no-act --noheadings {{ item.path }}
+          loop: "{{ md0_disks | selectattr('state', 'equalto', 'blank') | list }}"
+          loop_control:
+            label: "{{ item.path }}"
+          register: md0_wipefs
+          changed_when: false
+          failed_when: md0_wipefs.rc != 0
+          check_mode: false
+
+        - name: Final disk list
+          ansible.builtin.set_fact:
+            md0_members: "{{ md0_wipefs.results | selectattr('stdout', 'equalto', '') | map(attribute='item.path') | list }}"
+            md0_sigs: "{{ md0_wipefs.results | rejectattr('stdout', 'equalto', '') | map(attribute='item.path') | list }}"
+
+        - name: Disk table
+          ansible.builtin.debug:
+            msg: >-
+              {%- set out = ['wanted: ' ~ md0_size ~ md0_unit ~ ' disks, RAID ' ~ md0_level
+                             ~ (', exactly ' ~ md0_count if md0_count | int > 0 else '')] -%}
+              {%- for d in md0_disks -%}
+                {%- if d.state != 'other size' or (md0_show_all_disks | default(false) | bool) -%}
+                  {%- set st = 'in use: signature found by wipefs' if d.path in md0_sigs
+                               else ('USE' if d.path in md0_members else d.state) -%}
+                  {%- set _ = out.append(d.path ~ '  ' ~ d.size ~ '  => ' ~ st) -%}
+                {%- endif -%}
+              {%- endfor -%}
+              {%- set _ = out.append('other sizes (not shown): ' ~ (md0_disks | selectattr('state', 'equalto', 'other size') | map(attribute='path') | map('regex_replace', '^/dev/', '') | join(' '))) -%}
+              {{ out }}
+
+        - name: Check the number of disks
+          ansible.builtin.assert:
+            that: md0_members | length == md0_count | int
+            fail_msg: >-
+              Expected {{ md0_count }} usable {{ md0_size }}{{ md0_unit }} disks, found
+              {{ md0_members | length }}: {{ md0_members }}. Nothing was changed.
+          when: md0_count | int > 0
+
+        - name: Check there are enough disks for RAID {{ md0_level }}
+          ansible.builtin.assert:
+            that: >-
+              (md0_level == '1' and n | int >= 2) or (md0_level == '5' and n | int >= 3) or
+              (md0_level == '6' and n | int >= 4) or (md0_level == '10' and n | int >= 4 and n | int % 2 == 0)
+            fail_msg: >-
+              RAID {{ md0_level }} can't be built from {{ n }} disk(s)
+              (RAID 1: 2+, RAID 5: 3+, RAID 6: 4+, RAID 10: an even number, 4+).
+              Nothing was changed.
+          vars:
+            n: "{{ md0_members | length }}"
+
+        - name: Stop here in preview mode
+          ansible.builtin.meta: end_host
+          when: md0_is_preview | bool
+
+        - name: Need -e md0_create=true to create md0
+          ansible.builtin.assert:
+            that: md0_may_create | bool
+            fail_msg: >-
+              md0 would be created from {{ md0_members }} (RAID {{ md0_level }}).
+              Re-run with -e md0_create=true to do it. Nothing was changed.
+
+        - name: Create md0
+          ansible.builtin.command:
+            argv: >-
+              {{ ['mdadm', '--create', '/dev/md0', '--run', '--metadata=1.2',
+                  '--level=' ~ md0_level, '--raid-devices=' ~ (md0_members | length),
+                  '--bitmap=internal'] + md0_members }}
+          register: md0_created
+          changed_when: true
+
+        - name: Wait for udev
+          ansible.builtin.command: udevadm settle
+          changed_when: false
+
+    - name: md0 already exists - no disks touched
+      ansible.builtin.debug:
+        msg: "/dev/md0 exists already, so no disks were selected or changed."
+      when: md0_stat.stat.exists
+
+    # =================================================================
+    # mdadm.conf, so it always assembles as md0
+    # =================================================================
+    - name: Read md0 details
+      ansible.builtin.command: mdadm --detail --export /dev/md0
+      register: md0_detail
+      changed_when: false
+      check_mode: false
+      when: not (md0_is_preview | bool and not md0_stat.stat.exists)
+
+    - name: md0 facts
+      ansible.builtin.set_fact:
+        md0_uuid: "{{ md0_detail.stdout | regex_findall('MD_UUID=([0-9A-Fa-f:]+)') | first }}"
+        md0_actual_level: "{{ md0_detail.stdout | regex_findall('MD_LEVEL=raid([0-9]+)') | first }}"
+        md0_devices: "{{ md0_detail.stdout | regex_findall('MD_DEVICES=([0-9]+)') | first }}"
+
+    - name: Warn if the existing md0 is a different RAID level
+      ansible.builtin.debug:
+        msg: >-
+          WARNING: md0 is RAID {{ md0_actual_level }}, but md0_raid_level is {{ md0_level }}.
+          Existing arrays are never changed.
+      when: md0_actual_level != md0_level
+
+    - name: Is md0 LUKS?
+      ansible.builtin.command: cryptsetup isLuks /dev/md0
+      register: md0_isluks
+      changed_when: false
+      failed_when: md0_isluks.rc not in [0, 1]
+      check_mode: false
+
+    - name: Current clevis bindings
+      ansible.builtin.command: clevis luks list -d /dev/md0
+      register: md0_clevis
+      changed_when: false
+      failed_when: false
+      check_mode: false
+
+    - name: Preview of an existing md0
+      ansible.builtin.debug:
+        msg: >-
+          md0 exists: RAID {{ md0_actual_level }}, {{ md0_devices }} disks.
+          {{ ('LUKS: yes, tang ' ~ ('bound' if 'tang' in md0_clevis.stdout else 'NOT bound - will be bound'))
+             if md0_isluks.rc == 0 else 'LUKS: no - will be encrypted if md0 is empty' }}.
+      when: md0_is_preview | bool
+
+    - name: Stop here in preview mode
+      ansible.builtin.meta: end_host
+      when: md0_is_preview | bool
+
+    - name: Read mdadm.conf
+      ansible.builtin.command: cat /etc/mdadm.conf
+      register: md0_conf
+      changed_when: false
+      failed_when: false
+      check_mode: false
+
+    - name: Add md0 to mdadm.conf
+      ansible.builtin.lineinfile:
+        path: /etc/mdadm.conf
+        line: "ARRAY /dev/md0 metadata=1.2 UUID={{ md0_uuid }}"
+        create: true
+        mode: "0644"
+      when: md0_uuid not in md0_conf.stdout
+      notify: Regenerate initramfs
+
+    # =================================================================
+    # Encryption
+    # =================================================================
+
+    - name: Key and header paths
+      ansible.builtin.set_fact:
+        md0_keyfile: "{{ md0_keys }}/md0-{{ md0_uuid | replace(':', '') }}.key"
+        md0_header: "/root/luks-header-backups/md0-{{ md0_uuid | replace(':', '') }}.luksheader"
+
+    - name: Create local DR folder on the controller
+      ansible.builtin.file:
+        path: "{{ md0_keys }}"
+        state: directory
+        mode: "0700"
+      delegate_to: localhost
+      become: false
+
+    - name: Encrypt md0 (only if it has never been encrypted)
+      when: md0_isluks.rc != 0
+      block:
+        - name: md0 must be empty before it is encrypted
+          ansible.builtin.command: wipefs --no-act --noheadings /dev/md0
+          register: md0_sig
+          changed_when: false
+          failed_when: md0_sig.rc != 0 or md0_sig.stdout | trim | length > 0
+
+        - name: Need -e md0_create=true to encrypt md0
+          ansible.builtin.assert:
+            that: md0_may_create | bool
+            fail_msg: md0 is not encrypted yet. Re-run with -e md0_create=true to encrypt it.
+
+        - name: An empty md0 must not already have a key on the controller
+          ansible.builtin.stat:
+            path: "{{ md0_keyfile }}"
+          register: md0_oldkey
+          delegate_to: localhost
+          become: false
+          failed_when: md0_oldkey.stat.exists
+
+        - name: Generate the passphrase (saved on the controller first)
+          ansible.builtin.set_fact:
+            md0_pass: "{{ lookup('ansible.builtin.password', md0_keyfile ~ ' length=64 chars=ascii_letters,digits') }}"
+          no_log: true
+
+        - name: Confirm the key is saved on the controller
+          ansible.builtin.stat:
+            path: "{{ md0_keyfile }}"
+          register: md0_savedkey
+          delegate_to: localhost
+          become: false
+          failed_when: not md0_savedkey.stat.exists or md0_savedkey.stat.size == 0
+
+        - name: luksFormat md0 (LUKS2, key from stdin)
+          ansible.builtin.command:
+            argv: [cryptsetup, luksFormat, --type, luks2, --batch-mode, --label, "{{ md0_label }}", --key-file=-, /dev/md0]
+            stdin: "{{ md0_pass }}"
+            stdin_add_newline: false
+          register: md0_formatted
+          changed_when: true
+          no_log: true
+
+    - name: LUKS UUID
+      ansible.builtin.command: cryptsetup luksUUID /dev/md0
+      register: md0_luks_uuid
+      changed_when: false
+      check_mode: false
+
+    # ----------------------------- tang -------------------------------
+    - name: Bind md0 to tang
+      when: "'tang' not in md0_clevis.stdout"
+      block:
+        - name: Every tang server must be reachable to bind
+          ansible.builtin.uri:
+            url: "{{ item.url }}/adv"
+            timeout: 5
+          loop: "{{ md0_tang }}"
+          loop_control:
+            label: "{{ item.url }}"
+
+        - name: The DR key must be on the controller to bind an existing volume
+          ansible.builtin.stat:
+            path: "{{ md0_keyfile }}"
+          register: md0_havekey
+          delegate_to: localhost
+          become: false
+          failed_when: not md0_havekey.stat.exists
+          when: md0_pass is not defined
+
+        - name: Load the passphrase from the controller
+          ansible.builtin.set_fact:
+            md0_pass: "{{ lookup('ansible.builtin.file', md0_keyfile) }}"
+          no_log: true
+          when: md0_pass is not defined
+
+        - name: Bind (any {{ md0_t }} of {{ md0_tang | length }} tang servers unlocks)
+          ansible.builtin.command:
+            argv: [clevis, luks, bind, -y, -d, /dev/md0, -k, "-", sss, "{{ md0_policy | to_json }}"]
+            stdin: "{{ md0_pass }}"
+            stdin_add_newline: false
+          vars:
+            md0_policy: "{{ {'t': md0_t | int, 'pins': {'tang': md0_tang | map('dict2items') | map('selectattr', 'key', 'in', ['url', 'thp']) | map('items2dict') | list}} }}"
+          register: md0_bound
+          changed_when: true
+          no_log: true
+
+    - name: Prove tang unlocks md0
+      ansible.builtin.shell: |
+        set -o pipefail
+        slot=$(clevis luks list -d /dev/md0 | awk -F: '/sss|tang/ {print $1; exit}')
+        clevis luks pass -d /dev/md0 -s "$slot" | cryptsetup open --test-passphrase --key-file=- /dev/md0
+      args:
+        executable: /bin/bash
+      changed_when: false
+      no_log: true
+
+    # --------------------------- backups ------------------------------
+    - name: Header backup folder
+      ansible.builtin.file:
+        path: /root/luks-header-backups
+        state: directory
+        mode: "0700"
+
+    - name: Back up the LUKS header
+      ansible.builtin.shell: >-
+        rm -f {{ md0_header }} &&
+        cryptsetup luksHeaderBackup /dev/md0 --header-backup-file {{ md0_header }} &&
+        chmod 0400 {{ md0_header }}
+      args:
+        creates: "{{ omit if (md0_bound is changed or md0_formatted is changed) else md0_header }}"
+
+    - name: Copy the header backup to the controller
+      ansible.builtin.fetch:
+        src: "{{ md0_header }}"
+        dest: "{{ md0_keys }}/"
+        flat: true
+
+    - name: Recovery notes on the controller
+      ansible.builtin.copy:
+        dest: "{{ md0_keys }}/md0-{{ md0_uuid | replace(':', '') }}.yml"
+        mode: "0600"
+        content: "{{ {'type': 'data', 'device_at_setup': '/dev/md0', 'md_uuid': md0_uuid,
+                      'raid_level': md0_actual_level, 'raid_devices': md0_devices | int,
+                      'luks_uuid': md0_luks_uuid.stdout | trim, 'mapper': md0_mapper,
+                      'key_file': md0_keyfile | basename, 'header_backup': md0_header | basename,
+                      'tang_servers': md0_tang | map(attribute='url') | list} | to_nice_yaml }}"
+      delegate_to: localhost
+      become: false
+
+    # ---------------------- unlock at every boot ----------------------
+    - name: crypttab entry (no key file - unlocked by tang)
+      ansible.builtin.lineinfile:
+        path: /etc/crypttab
+        regexp: '^\S+\s+UUID={{ md0_luks_uuid.stdout | trim }}\s'
+        line: "{{ md0_mapper }} UUID={{ md0_luks_uuid.stdout | trim }} none luks,_netdev,nofail"
+        create: true
+        mode: "0600"
+
+    - name: Unlock non-root volumes through tang at boot
+      ansible.builtin.systemd_service:
+        name: "{{ item }}"
+        enabled: true
+      loop:
+        - clevis-luks-askpass.path
+        - remote-cryptsetup.target
+
+    - name: Unlock md0 now
+      ansible.builtin.command: clevis luks unlock -d /dev/md0 -n {{ md0_mapper }}
+      args:
+        creates: "/dev/mapper/{{ md0_mapper }}"
+
+    # ---------------------- optional filesystem -----------------------
+    - name: Filesystem and mount
+      when: md0_fs | length > 0
+      block:
+        - name: What is inside the encrypted volume?
+          ansible.builtin.command: blkid -p -o value -s TYPE /dev/mapper/{{ md0_mapper }}
+          register: md0_inner
+          changed_when: false
+          failed_when: md0_inner.rc not in [0, 2]
+
+        - name: Create the filesystem (only if the volume is completely empty)
+          ansible.builtin.command:
+            argv: "{{ ['mkfs.' ~ md0_fs] + (['-L', md0_fslabel] if md0_fslabel | length > 0 else []) + ['/dev/mapper/' ~ md0_mapper] }}"
+          when: md0_inner.stdout | trim | length == 0
+          changed_when: true
+
+        - name: Warn if a different filesystem is already there
+          ansible.builtin.debug:
+            msg: "WARNING: /dev/mapper/{{ md0_mapper }} already holds {{ md0_inner.stdout | trim }}; left as it is."
+          when: md0_inner.stdout | trim not in ['', md0_fs]
+
+        - name: Mount point
+          ansible.builtin.file:
+            path: "{{ md0_mnt }}"
+            state: directory
+            mode: "0755"
+
+        - name: fstab entry
+          ansible.builtin.lineinfile:
+            path: /etc/fstab
+            regexp: '^\S+\s+{{ md0_mnt | regex_escape }}\s'
+            line: "/dev/mapper/{{ md0_mapper }} {{ md0_mnt }} {{ md0_inner.stdout | trim or md0_fs }} defaults,_netdev,nofail 0 0"
+            backup: true
+
+        - name: Is it mounted?
+          ansible.builtin.command: findmnt -no SOURCE {{ md0_mnt }}
+          register: md0_mounted
+          changed_when: false
+          failed_when: false
+
+        - name: Mount
+          ansible.builtin.command: mount {{ md0_mnt }}
+          when: md0_mounted.rc != 0
+          changed_when: true
+
+    # ============================ summary =============================
+    - name: Array status
+      ansible.builtin.command: cat /proc/mdstat
+      register: md0_mdstat
+      changed_when: false
+
+    - name: Summary
+      ansible.builtin.debug:
+        msg:
+          - "md0: RAID {{ md0_actual_level }}, {{ md0_devices }} disks, UUID {{ md0_uuid }}"
+          - "LUKS: {{ md0_luks_uuid.stdout | trim }} open as /dev/mapper/{{ md0_mapper }}, bound to {{ md0_tang | map(attribute='url') | join(' + ') }} (any {{ md0_t }})"
+          - "DR key and header: {{ md0_keys }}"
+          - "{{ md0_mdstat.stdout_lines | select('search', 'md0|resync|recovery') | list }}"
