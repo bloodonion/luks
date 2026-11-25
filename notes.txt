@@ -1,0 +1,14 @@
+umount /opt /var/lib/containers 2>/dev/null
+vgchange -an datavg 2>/dev/null
+cryptsetup close md0_crypt 2>/dev/null
+wipefs -a /dev/md0
+
+umount /opt /var/lib/containers
+vgchange -an datavg
+cryptsetup close md0_crypt
+wipefs -a /dev/md0              # this was the missing step
+mdadm --stop /dev/md0
+mdadm --zero-superblock $DISKS
+wipefs -a $DISKS
+
+Then remove the md0 lines from /etc/mdadm.conf, /etc/crypttab and /etc/fstab, and run dracut -f --regenerate-all.
